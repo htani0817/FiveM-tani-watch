@@ -255,7 +255,7 @@ kbd {
     color: rgba(255, 255, 255, 0.5);
 }
 
-/* ================== ビデオプレイヤー画面 ================== */
+/* ================== ビデオプレイヤー画面（DUIオーバーレイ） ================== */
 #player-container {
     position: fixed;
     top: 0;
@@ -263,22 +263,23 @@ kbd {
     width: 100vw;
     height: 100vh;
     display: flex;
-    justify-content: center;
-    align-items: center;
+    flex-direction: column;
+    justify-content: space-between;
+    pointer-events: none;
     animation: fadeIn 0.3s ease-out;
 }
 
-.player-wrapper {
-    width: 90%;
-    max-width: 1100px;
-    background: linear-gradient(165deg, #1e1e2e 0%, #0f0f18 100%);
-    border-radius: 20px;
-    overflow: hidden;
-    box-shadow: 
-        0 0 0 1px rgba(255, 255, 255, 0.05),
-        0 30px 60px -15px rgba(0, 0, 0, 0.8),
-        0 0 100px rgba(139, 92, 246, 0.08);
-    animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+.player-controls-overlay {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    height: 100%;
+    pointer-events: none;
+}
+
+.player-controls-overlay .player-header,
+.player-controls-overlay .controls-panel {
+    pointer-events: auto;
 }
 
 .player-header {
@@ -286,8 +287,7 @@ kbd {
     justify-content: space-between;
     align-items: center;
     padding: 14px 20px;
-    background: rgba(255, 255, 255, 0.02);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    background: linear-gradient(180deg, rgba(0,0,0,0.7) 0%, rgba(0,0,0,0) 100%);
 }
 
 .header-left {
@@ -302,39 +302,6 @@ kbd {
     gap: 10px;
 }
 
-.live-indicator {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 5px 12px;
-    background: rgba(239, 68, 68, 0.12);
-    border: 1px solid rgba(239, 68, 68, 0.25);
-    border-radius: 16px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 1px;
-    color: #ef4444;
-}
-
-.live-dot {
-    width: 7px;
-    height: 7px;
-    background: #ef4444;
-    border-radius: 50%;
-    animation: pulse 1.5s ease-in-out infinite;
-}
-
-@keyframes pulse {
-    0%, 100% {
-        opacity: 1;
-        transform: scale(1);
-    }
-    50% {
-        opacity: 0.5;
-        transform: scale(1.15);
-    }
-}
-
 .platform-badge {
     padding: 5px 12px;
     background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
@@ -346,6 +313,10 @@ kbd {
 
 .platform-badge.twitch {
     background: linear-gradient(135deg, #9146ff 0%, #772ce8 100%);
+}
+
+.platform-badge.youtube {
+    background: linear-gradient(135deg, #ff0000 0%, #cc0000 100%);
 }
 
 .platform-badge.youtube {
@@ -392,8 +363,7 @@ kbd {
     justify-content: space-between;
     align-items: center;
     padding: 16px 20px;
-    background: rgba(0, 0, 0, 0.25);
-    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    background: linear-gradient(0deg, rgba(0,0,0,0.7) 0%, rgba(0,0,0,0) 100%);
 }
 
 .volume-control {

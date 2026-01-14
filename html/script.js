@@ -15,7 +15,6 @@ const shareConfirmBtn = document.getElementById('share-confirm-btn');
 
 // DOM要素 - プレイヤー画面
 const playerContainer = document.getElementById('player-container');
-const videoFrame = document.getElementById('video-frame');
 const playerCloseBtn = document.getElementById('player-close-btn');
 const backBtn = document.getElementById('back-btn');
 const volumeBtn = document.getElementById('volume-btn');
@@ -31,6 +30,7 @@ let previousVolume = 50;
 let selectedPlayers = new Set();
 let nearbyPlayers = [];
 let isPlayerListOpen = false;
+let currentPlatform = 'youtube';
 
 // FiveMからのメッセージを受信
 window.addEventListener('message', function(event) {
@@ -38,15 +38,12 @@ window.addEventListener('message', function(event) {
 
     if (data.action === 'openInput') {
         showInputScreen();
-        // 付近プレイヤーを取得
         requestNearbyPlayers();
     } else if (data.action === 'close') {
         closeAll();
     } else if (data.action === 'updateNearbyPlayers') {
-        // 付近プレイヤーリストを更新
         updateNearbyPlayersList(data.players);
     } else if (data.action === 'receiveShare') {
-        // 画面共有を受信
         showSharedVideo(data.url, data.fromPlayer);
     }
 });
@@ -72,21 +69,25 @@ function showInputScreen() {
 
 // プレイヤー画面を表示
 function showPlayerScreen(url) {
-    const embedUrl = parseVideoUrl(url);
-    
-    if (embedUrl) {
-        videoFrame.src = embedUrl.url;
-        updatePlatformBadge(embedUrl.platform);
-        inputContainer.classList.add('hidden');
-        playerContainer.classList.remove('hidden');
+    const platform = detectPlatform(url);
+    currentPlatform = platform;
+    updatePlatformBadge(platform);
+    inputContainer.classList.add('hidden');
+    playerContainer.classList.remove('hidden');
+}
+
+// プラットフォームを検出
+function detectPlatform(url) {
+    if (url.includes('twitch.tv') || url.includes('clips.twitch.tv')) {
+        return 'twitch';
     }
+    return 'youtube';
 }
 
 // 全て閉じる
 function closeAll() {
     inputContainer.classList.add('hidden');
     playerContainer.classList.add('hidden');
-    videoFrame.src = '';
     urlInput.value = '';
     errorMessage.classList.add('hidden');
     hidePlayerList();
@@ -95,40 +96,23 @@ function closeAll() {
 
 // URL入力画面に戻る
 function backToInput() {
-    videoFrame.src = '';
     playerContainer.classList.add('hidden');
     inputContainer.classList.remove('hidden');
     requestNearbyPlayers();
     urlInput.focus();
-}
-
-// URLを解析して埋め込みURLを生成
-function parseVideoUrl(url) {
-    // YouTube 通常動画
-    let match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
-    if (match) {
-        return {
-            url: `https://www.youtube.com/embed/${match[1]}?autoplay=1&enablejsapi=1`,
-            platform: 'youtube'
-        };
-    }
-
-    // YouTube Shorts
-    match = url.match(/youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/);
-    if (match) {
-        return {
-            url: `https://www.youtube.com/embed/${match[1]}?autoplay=1&enablejsapi=1`,
-            platform: 'youtube'
-        };
-    }
-
-    return null;
+    
+    // Luaに停止を通知
+    fetch('https://tani-watch/stopVideo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    });
 }
 
 // プラットフォームバッジを更新
 function updatePlatformBadge(platform) {
     platformBadge.className = 'platform-badge ' + platform;
-    platformBadge.textContent = 'YouTube';
+    platformBadge.textContent = platform === 'twitch' ? 'Twitch' : 'YouTube';
 }
 
 // エラーを表示
@@ -142,35 +126,35 @@ function hideError() {
     errorMessage.classList.add('hidden');
 }
 
+// URLを検証
+function validateUrl(url) {
+    if (!url) {
+        return { valid: false, message: 'URLを入力してください' };
+    }
+    
+    const isYouTube = url.includes('youtube.com') || url.includes('youtu.be');
+    const isTwitch = url.includes('twitch.tv') || url.includes('clips.twitch.tv');
+    
+    if (!isYouTube && !isTwitch) {
+        return { valid: false, message: 'YouTubeまたはTwitchのURLを入力してください' };
+    }
+    
+    return { valid: true };
+}
+
 // URLを検証して再生
 function validateAndPlay() {
     const url = urlInput.value.trim();
+    const validation = validateUrl(url);
     
-    if (!url) {
-        showError('URLを入力してください');
-        return;
-    }
-    
-    // Twitchは非対応
-    if (url.includes('twitch.tv')) {
-        showError('TwitchはFiveMのNUI環境では再生できません。YouTubeをご利用ください。');
-        return;
-    }
-    
-    if (!(url.includes('youtube.com') || url.includes('youtu.be'))) {
-        showError('YouTubeのURLを入力してください');
-        return;
-    }
-    
-    const embedUrl = parseVideoUrl(url);
-    if (!embedUrl) {
-        showError('無効なURLです。正しいURLを入力してください');
+    if (!validation.valid) {
+        showError(validation.message);
         return;
     }
     
     hideError();
     
-    // サーバーに通知
+    // サーバーに通知（DUIで再生）
     fetch('https://tani-watch/playVideo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -179,20 +163,14 @@ function validateAndPlay() {
     .then(response => response.text())
     .then(text => {
         console.log('Server response:', text);
-        if (!text || text === 'ok' || text === '1') {
-            showPlayerScreen(url);
-            return;
-        }
         try {
             const data = JSON.parse(text);
-            if (data.success || data.success === undefined) {
-                showPlayerScreen(url);
-            } else {
-                showError(data.message || 'サーバーエラーが発生しました');
+            if (data.success === false) {
+                showError(data.message || 'エラーが発生しました');
+                return;
             }
-        } catch (e) {
-            showPlayerScreen(url);
-        }
+        } catch (e) {}
+        showPlayerScreen(url);
     })
     .catch(err => {
         console.log('Fetch error:', err);
@@ -202,7 +180,6 @@ function validateAndPlay() {
 
 // ================== 画面共有機能 ==================
 
-// 画面共有ボタン
 shareBtn.addEventListener('click', function() {
     if (isPlayerListOpen) {
         hidePlayerList();
@@ -212,14 +189,12 @@ shareBtn.addEventListener('click', function() {
     }
 });
 
-// プレイヤーリストを表示
 function showPlayerList() {
     isPlayerListOpen = true;
     playerListContainer.classList.remove('hidden');
     shareBtn.classList.add('active');
 }
 
-// プレイヤーリストを非表示
 function hidePlayerList() {
     isPlayerListOpen = false;
     playerListContainer.classList.add('hidden');
@@ -228,7 +203,6 @@ function hidePlayerList() {
     updateShareButton();
 }
 
-// 付近プレイヤーリストを更新
 function updateNearbyPlayersList(players) {
     nearbyPlayers = players || [];
     playerCount.textContent = nearbyPlayers.length + '人';
@@ -253,7 +227,6 @@ function updateNearbyPlayersList(players) {
         </div>
     `).join('');
     
-    // プレイヤーアイテムにクリックイベントを設定
     playerList.querySelectorAll('.player-item').forEach(item => {
         item.addEventListener('click', function() {
             const playerId = parseInt(this.dataset.id);
@@ -265,7 +238,6 @@ function updateNearbyPlayersList(players) {
     updateShareButton();
 }
 
-// プレイヤー選択を切り替え
 function togglePlayerSelection(playerId) {
     if (selectedPlayers.has(playerId)) {
         selectedPlayers.delete(playerId);
@@ -275,7 +247,6 @@ function togglePlayerSelection(playerId) {
     updateShareButton();
 }
 
-// 共有ボタンの状態を更新
 function updateShareButton() {
     const count = selectedPlayers.size;
     if (count === 0) {
@@ -287,12 +258,12 @@ function updateShareButton() {
     }
 }
 
-// 共有確定ボタン
 shareConfirmBtn.addEventListener('click', function() {
     const url = urlInput.value.trim();
+    const validation = validateUrl(url);
     
-    if (!url) {
-        showError('URLを入力してください');
+    if (!validation.valid) {
+        showError(validation.message);
         return;
     }
     
@@ -301,26 +272,8 @@ shareConfirmBtn.addEventListener('click', function() {
         return;
     }
     
-    // Twitchチェック
-    if (url.includes('twitch.tv')) {
-        showError('TwitchはFiveMのNUI環境では再生できません。YouTubeをご利用ください。');
-        return;
-    }
-    
-    if (!(url.includes('youtube.com') || url.includes('youtu.be'))) {
-        showError('YouTubeのURLを入力してください');
-        return;
-    }
-    
-    const embedUrl = parseVideoUrl(url);
-    if (!embedUrl) {
-        showError('無効なURLです。正しいURLを入力してください');
-        return;
-    }
-    
     hideError();
     
-    // 共有を送信
     fetch('https://tani-watch/shareVideo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -332,7 +285,6 @@ shareConfirmBtn.addEventListener('click', function() {
     .then(response => response.text())
     .then(text => {
         console.log('Share response:', text);
-        // 自分も再生開始
         showPlayerScreen(url);
     })
     .catch(err => {
@@ -341,18 +293,11 @@ shareConfirmBtn.addEventListener('click', function() {
     });
 });
 
-// 共有を受信して動画を表示
 function showSharedVideo(url, fromPlayer) {
-    // 通知を表示
     showShareNotification(fromPlayer);
-    
-    // 動画を再生
     showPlayerScreen(url);
-    inputContainer.classList.add('hidden');
-    playerContainer.classList.remove('hidden');
 }
 
-// 共有通知を表示
 function showShareNotification(fromPlayer) {
     removeNotifications();
     
@@ -380,19 +325,13 @@ function showShareNotification(fromPlayer) {
     `;
     
     document.body.appendChild(notification);
-    
-    // 5秒後に自動削除
-    setTimeout(() => {
-        notification.remove();
-    }, 5000);
+    setTimeout(() => notification.remove(), 5000);
 }
 
-// 通知を削除
 function removeNotifications() {
     document.querySelectorAll('.share-notification').forEach(n => n.remove());
 }
 
-// HTMLエスケープ
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
@@ -401,31 +340,24 @@ function escapeHtml(text) {
 
 // ================== 基本機能 ==================
 
-// ペーストボタン
 pasteBtn.addEventListener('click', async function() {
     try {
         const text = await navigator.clipboard.readText();
         urlInput.value = text;
         hideError();
-    } catch (err) {
-        // クリップボードアクセス拒否
-    }
+    } catch (err) {}
 });
 
-// 再生ボタン
 playBtn.addEventListener('click', validateAndPlay);
 
-// Enterキーで再生
 urlInput.addEventListener('keydown', function(e) {
     if (e.key === 'Enter') {
         validateAndPlay();
     }
 });
 
-// 入力時にエラーを消す
 urlInput.addEventListener('input', hideError);
 
-// 閉じるボタン（入力画面）
 inputCloseBtn.addEventListener('click', function() {
     fetch('https://tani-watch/close', {
         method: 'POST',
@@ -434,7 +366,6 @@ inputCloseBtn.addEventListener('click', function() {
     });
 });
 
-// 閉じるボタン（プレイヤー画面）
 playerCloseBtn.addEventListener('click', function() {
     fetch('https://tani-watch/close', {
         method: 'POST',
@@ -443,8 +374,14 @@ playerCloseBtn.addEventListener('click', function() {
     });
 });
 
-// 戻るボタン
-backBtn.addEventListener('click', backToInput);
+backBtn.addEventListener('click', function() {
+    fetch('https://tani-watch/backToInput', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    });
+    backToInput();
+});
 
 // 音量スライダー
 volumeSlider.addEventListener('input', function() {
@@ -469,7 +406,6 @@ volumeBtn.addEventListener('click', function() {
     sendVolumeToServer();
 });
 
-// 音量UIを更新
 function updateVolumeUI() {
     volumeFill.style.width = currentVolume + '%';
     volumeValue.textContent = currentVolume + '%';
@@ -495,20 +431,8 @@ function updateVolumeUI() {
         `;
         volumeBtn.classList.remove('muted');
     }
-
-    // iframeに音量を適用
-    try {
-        if (videoFrame.contentWindow) {
-            videoFrame.contentWindow.postMessage(JSON.stringify({
-                event: 'command',
-                func: 'setVolume',
-                args: [currentVolume]
-            }), '*');
-        }
-    } catch (e) {}
 }
 
-// サーバーに音量を送信
 function sendVolumeToServer() {
     fetch('https://tani-watch/volumeChange', {
         method: 'POST',
