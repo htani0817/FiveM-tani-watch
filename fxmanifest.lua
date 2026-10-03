@@ -1,11 +1,10 @@
 fx_version 'cerulean'
 game 'gta5'
-lua54 'yes'
 
 name 'tani-watch'
 description 'YouTube/Twitch Video Player with DUI and screen sharing'
 author 'Tani'
-version '2.2.0'
+version '2.2.1'
 
 shared_scripts {
     'config.lua',

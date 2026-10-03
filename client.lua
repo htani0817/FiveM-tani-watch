@@ -5,8 +5,18 @@
 
 local isOpen = false        -- NUI（入力画面 / 視聴画面）を開いているか
 local isPlaying = false     -- 動画を再生中か
+local keepsGameInput = false -- カーソルを出したままゲームへ入力を渡している（視聴画面）か
 local playSeq = 0           -- 再生要求の通し番号（待機中に閉じられた要求を捨てるために使う）
 local currentVolume = 50
+
+-- カーソルを出したままゲームへ入力を渡している間、毎フレーム無効にするコントロール
+-- （無効にしないと、カメラが動いたり、ボタンのクリックが射撃・殴打として届いたりする）
+-- 1・2: 視点 / 24・25・257: 攻撃・照準 / 68〜70・91・92・106・114: 乗り物の照準・攻撃
+-- 142: 近接攻撃(マウス) / 239・240: カーソルの X・Y
+-- 歩く・運転するなどのキーボード操作は残す（R・Q の近接攻撃キー 140・141・263・264 も対象外）
+local CONTROLS_BLOCKED_WHILE_KEEPING_INPUT = {
+    1, 2, 24, 25, 257, 68, 69, 70, 91, 92, 106, 114, 142, 239, 240,
+}
 
 -- DUI
 local duiObject = nil
@@ -81,16 +91,8 @@ local function createDui()
     return true
 end
 
-local function destroyDui()
-    if duiObject then
-        DestroyDui(duiObject)
-        duiObject = nil
-        duiPageReady = false
-        TaniWatch.Log('DUI Player destroyed')
-    end
-end
-
--- DUI の準備ができるまで待つ。間に合わなければ false
+-- DUI のブラウザが作られ、ページが準備完了を通知するまで待つ。間に合わなければ false
+-- （IsDuiAvailable は「ブラウザが作られたか」だけを返し、ページの読み込み完了は示さない）
 local function waitForDui()
     local deadline = GetGameTimer() + Config.DuiReadyTimeoutMs
 
@@ -139,8 +141,9 @@ end
 -- 入力画面: キーボードもマウスも NUI が使う
 -- 視聴画面: 設定により、キーボードはゲームへ渡す（歩く・運転するなどができる）
 local function applyFocus(screen)
+    keepsGameInput = screen == 'player' and Config.AllowGameInputWhileWatching == true
     SetNuiFocus(true, true)
-    SetNuiFocusKeepInput(screen == 'player' and Config.AllowGameInputWhileWatching == true)
+    SetNuiFocusKeepInput(keepsGameInput)
 end
 
 -- 動画を再生して視聴画面へ進む。成功で true、失敗で false とエラーメッセージ
@@ -191,6 +194,7 @@ local function closePlayer()
 
     isOpen = false
     isPlaying = false
+    keepsGameInput = false
     SetNuiFocusKeepInput(false)
     SetNuiFocus(false, false)
     SendNUIMessage({ action = 'close' })
@@ -532,6 +536,7 @@ end)
 -- ================== キー入力処理 ==================
 
 -- ESC で閉じる（キーボードがゲームへ渡っているとき用。NUI にフォーカスがあるときは JS 側で閉じる）
+-- あわせて、視聴画面でカーソルを出したままゲームへ入力を渡している間は、視点と攻撃を無効にする
 CreateThread(function()
     while true do
         if isOpen then
@@ -539,6 +544,10 @@ CreateThread(function()
             DisableControlAction(0, 200, true) -- ESC
             if IsDisabledControlJustReleased(0, 200) then
                 closePlayer()
+            elseif keepsGameInput then
+                for _, control in ipairs(CONTROLS_BLOCKED_WHILE_KEEPING_INPUT) do
+                    DisableControlAction(0, control, true)
+                end
             end
         else
             Wait(250)
@@ -546,18 +555,9 @@ CreateThread(function()
     end
 end)
 
--- ================== 後始末・登録 ==================
+-- ================== 登録 ==================
 
--- リソース停止時にクリーンアップ（入力フォーカスも必ず解除する）
-AddEventHandler('onResourceStop', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then
-        return
-    end
-
-    SetNuiFocusKeepInput(false)
-    SetNuiFocus(false, false)
-    destroyDui()
-end)
+-- リソース停止時の DUI の破棄と NUI フォーカスの解除は、FiveM 本体が行うので、ここでは何もしない
 
 -- チャットのコマンド候補（chat がまだ起動していない場合に備え、chat の起動時にも登録する）
 local function registerSuggestions()
