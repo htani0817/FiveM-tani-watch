@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tani Watch Player</title>
-    <script src="https://player.twitch.tv/js/embed/v1.js"></script>
-    <script src="https://www.youtube.com/iframe_api"></script>
     <style>
         * {
             margin: 0;
@@ -30,196 +28,337 @@
             width: 100% !important;
             height: 100% !important;
         }
-        .no-signal {
-            color: #333;
-            font-family: Arial, sans-serif;
-            font-size: 24px;
+        #player-container > iframe {
+            border: 0;
+        }
+        .status-text {
+            padding: 0 48px;
+            color: #888;
+            font-family: Arial, 'Yu Gothic UI', 'Meiryo UI', sans-serif;
+            font-size: 28px;
+            line-height: 1.5;
             text-align: center;
+        }
+        .status-text.error {
+            color: #f87171;
         }
     </style>
 </head>
 <body>
     <div id="player-container">
-        <div class="no-signal">NO SIGNAL</div>
+        <div class="status-text">NO SIGNAL</div>
     </div>
 
     <script>
-        let player = null;
-        let playerType = null;
-        let currentVolume = 50;
+        (function () {
+            'use strict';
 
-        // YouTubeのURLからビデオIDを抽出
-        function getYouTubeId(url) {
-            const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/);
-            return match ? match[1] : null;
-        }
+            const container = document.getElementById('player-container');
+            // リソース名はホスト名（cfx-nui-<リソース名>）から求める
+            const resourceName = location.hostname.replace(/^cfx-nui-/, '');
 
-        // TwitchのURLからチャンネル/ビデオ情報を抽出
-        function getTwitchInfo(url) {
-            // ビデオ (VOD)
-            let match = url.match(/twitch\.tv\/videos\/(\d+)/);
-            if (match) {
-                return { type: 'video', id: match[1] };
-            }
-            
-            // クリップ
-            match = url.match(/twitch\.tv\/[^\/]+\/clip\/([a-zA-Z0-9_-]+)/);
-            if (match) {
-                return { type: 'clip', id: match[1] };
-            }
-            
-            // clips.twitch.tv形式
-            match = url.match(/clips\.twitch\.tv\/([a-zA-Z0-9_-]+)/);
-            if (match) {
-                return { type: 'clip', id: match[1] };
-            }
-            
-            // チャンネル（ライブ）
-            match = url.match(/twitch\.tv\/([a-zA-Z0-9_]+)\/?$/);
-            if (match) {
-                return { type: 'channel', id: match[1] };
-            }
-            
-            return null;
-        }
+            let player = null;
+            let playerType = null;
+            let currentVolume = 50;
+            let playToken = 0; // 古い非同期処理の結果を捨てるための通し番号
 
-        // プレイヤーを破棄
-        function destroyPlayer() {
-            if (player) {
+            const YOUTUBE_ERRORS = {
+                2: 'URLが正しくありません',
+                5: 'プレイヤーでエラーが発生しました',
+                100: '動画が見つからないか、非公開です',
+                101: 'この動画は埋め込み再生が許可されていません',
+                150: 'この動画は埋め込み再生が許可されていません'
+            };
+
+            // Lua へ通知する（DUI からのコールバックが使えない環境では何もしない）
+            function notifyLua(name, body) {
                 try {
-                    if (playerType === 'youtube' && player.destroy) {
-                        player.destroy();
-                    } else if (playerType === 'twitch') {
-                        // Twitchプレイヤーは親要素をクリアして破棄
-                        document.getElementById('player-container').innerHTML = '';
-                    }
+                    fetch('https://' + resourceName + '/' + name, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+                        body: JSON.stringify(body || {})
+                    }).catch(function () {});
                 } catch (e) {
-                    console.log('Error destroying player:', e);
+                    // 通知できなくても再生には影響させない
+                }
+            }
+
+            // 画面中央にメッセージを出す
+            function showStatus(text, isError) {
+                const div = document.createElement('div');
+                div.className = 'status-text' + (isError ? ' error' : '');
+                div.textContent = text;
+                container.replaceChildren(div);
+            }
+
+            // 画面に表示し、Lua にも伝える
+            function showError(text) {
+                showStatus(text, true);
+                notifyLua('duiStatus', { message: text });
+            }
+
+            // ---------- 外部スクリプトの遅延読み込み ----------
+            // 再生要求が来たときだけ YouTube / Twitch のスクリプトを読み込む
+
+            function withTimeout(promise, ms, message) {
+                return new Promise(function (resolve, reject) {
+                    const timer = setTimeout(function () { reject(new Error(message)); }, ms);
+                    promise.then(function (value) {
+                        clearTimeout(timer);
+                        resolve(value);
+                    }, function (err) {
+                        clearTimeout(timer);
+                        reject(err);
+                    });
+                });
+            }
+
+            function loadScript(src) {
+                return new Promise(function (resolve, reject) {
+                    const script = document.createElement('script');
+                    script.src = src;
+                    script.async = true;
+                    script.onload = function () { resolve(); };
+                    script.onerror = function () {
+                        script.remove();
+                        reject(new Error('script load failed: ' + src));
+                    };
+                    document.head.appendChild(script);
+                });
+            }
+
+            let youtubeApiPromise = null;
+            function loadYouTubeApi() {
+                if (window.YT && window.YT.Player) {
+                    return Promise.resolve();
+                }
+                if (!youtubeApiPromise) {
+                    youtubeApiPromise = withTimeout(new Promise(function (resolve, reject) {
+                        window.onYouTubeIframeAPIReady = function () { resolve(); };
+                        loadScript('https://www.youtube.com/iframe_api').catch(reject);
+                    }), 15000, 'YouTube API timeout').catch(function (err) {
+                        youtubeApiPromise = null; // 次の再生で読み込みをやり直す
+                        throw err;
+                    });
+                }
+                return youtubeApiPromise;
+            }
+
+            let twitchApiPromise = null;
+            function loadTwitchApi() {
+                if (window.Twitch && window.Twitch.Player) {
+                    return Promise.resolve();
+                }
+                if (!twitchApiPromise) {
+                    twitchApiPromise = withTimeout(
+                        loadScript('https://player.twitch.tv/js/embed/v1.js').then(function () {
+                            if (!(window.Twitch && window.Twitch.Player)) {
+                                throw new Error('Twitch API unavailable');
+                            }
+                        }),
+                        15000,
+                        'Twitch API timeout'
+                    ).catch(function (err) {
+                        twitchApiPromise = null;
+                        throw err;
+                    });
+                }
+                return twitchApiPromise;
+            }
+
+            // ---------- 再生 ----------
+
+            // Lua から渡されたメディア情報を、受け取る側でも厳密に検証する
+            function isValidMedia(media) {
+                if (!media || typeof media !== 'object') return false;
+                const id = media.id;
+                if (typeof id !== 'string') return false;
+
+                if (media.platform === 'youtube') {
+                    return media.kind === 'video' && /^[A-Za-z0-9_-]{11}$/.test(id);
+                }
+                if (media.platform === 'twitch') {
+                    if (media.kind === 'channel') return /^[A-Za-z0-9_]{1,25}$/.test(id);
+                    if (media.kind === 'video') return /^[0-9]{1,20}$/.test(id);
+                    if (media.kind === 'clip') return /^[A-Za-z0-9_-]{1,100}$/.test(id);
+                }
+                return false;
+            }
+
+            function destroyPlayer() {
+                if (player) {
+                    try {
+                        if (playerType === 'youtube' && player.destroy) {
+                            player.destroy();
+                        }
+                    } catch (e) {
+                        console.log('Error destroying player:', e);
+                    }
                 }
                 player = null;
                 playerType = null;
             }
-        }
 
-        // 動画を再生
-        function playVideo(url) {
-            destroyPlayer();
-            
-            const container = document.getElementById('player-container');
-            container.innerHTML = '<div id="player"></div>';
-            
-            // YouTube
-            const youtubeId = getYouTubeId(url);
-            if (youtubeId) {
+            function createMount() {
+                const mount = document.createElement('div');
+                mount.id = 'player';
+                container.replaceChildren(mount);
+            }
+
+            function startYouTube(media, token) {
+                createMount();
                 playerType = 'youtube';
                 player = new YT.Player('player', {
                     width: '100%',
                     height: '100%',
-                    videoId: youtubeId,
+                    videoId: media.id,
                     playerVars: {
                         autoplay: 1,
                         controls: 1,
                         modestbranding: 1,
-                        rel: 0
+                        rel: 0,
+                        playsinline: 1
                     },
                     events: {
-                        onReady: function(event) {
+                        onReady: function (event) {
+                            if (token !== playToken) return;
                             event.target.setVolume(currentVolume);
+                            if (currentVolume > 0) event.target.unMute();
                             event.target.playVideo();
+                        },
+                        onError: function (event) {
+                            if (token !== playToken) return;
+                            const message = YOUTUBE_ERRORS[event.data] || ('動画を再生できません（エラー ' + event.data + '）');
+                            destroyPlayer();
+                            showError(message);
                         }
                     }
                 });
-                return true;
             }
-            
-            // Twitch
-            const twitchInfo = getTwitchInfo(url);
-            if (twitchInfo) {
+
+            function startTwitch(media, token) {
+                const parent = location.hostname;
+
+                if (media.kind === 'clip') {
+                    // クリップは iframe で埋め込む（音量の操作はできない）
+                    const iframe = document.createElement('iframe');
+                    iframe.src = 'https://clips.twitch.tv/embed?clip=' + encodeURIComponent(media.id) +
+                        '&parent=' + encodeURIComponent(parent) + '&autoplay=true';
+                    iframe.setAttribute('allow', 'autoplay; fullscreen');
+                    iframe.allowFullscreen = true;
+                    container.replaceChildren(iframe);
+                    playerType = 'twitch-clip';
+                    return;
+                }
+
+                createMount();
                 playerType = 'twitch';
-                
+
                 const options = {
                     width: '100%',
                     height: '100%',
                     autoplay: true,
-                    muted: false
+                    muted: false,
+                    parent: [parent]
                 };
-                
-                if (twitchInfo.type === 'channel') {
-                    options.channel = twitchInfo.id;
-                } else if (twitchInfo.type === 'video') {
-                    options.video = twitchInfo.id;
-                } else if (twitchInfo.type === 'clip') {
-                    // クリップはiframeで埋め込む
-                    container.innerHTML = `<iframe 
-                        src="https://clips.twitch.tv/embed?clip=${twitchInfo.id}&parent=cfx-nui-tani-watch&autoplay=true" 
-                        width="100%" 
-                        height="100%" 
-                        frameborder="0" 
-                        allowfullscreen>
-                    </iframe>`;
-                    return true;
+                if (media.kind === 'channel') {
+                    options.channel = media.id;
+                } else {
+                    options.video = media.id;
                 }
-                
+
                 player = new Twitch.Player('player', options);
-                
-                player.addEventListener(Twitch.Player.READY, function() {
+                player.addEventListener(Twitch.Player.READY, function () {
+                    if (token !== playToken) return;
                     player.setVolume(currentVolume / 100);
-                    player.setMuted(false);
+                    player.setMuted(currentVolume === 0);
                 });
-                
-                return true;
             }
-            
-            container.innerHTML = '<div class="no-signal">INVALID URL</div>';
-            return false;
-        }
 
-        // 音量を設定
-        function setVolume(volume) {
-            currentVolume = volume;
-            
-            if (!player) return;
-            
-            try {
-                if (playerType === 'youtube' && player.setVolume) {
-                    player.setVolume(volume);
-                    if (volume > 0) player.unMute();
-                } else if (playerType === 'twitch' && player.setVolume) {
-                    player.setVolume(volume / 100);
-                    if (volume > 0) player.setMuted(false);
+            async function playMedia(media) {
+                const token = ++playToken;
+                destroyPlayer();
+
+                if (!isValidMedia(media)) {
+                    showError('再生できないURLです');
+                    return;
                 }
-            } catch (e) {
-                console.log('Error setting volume:', e);
-            }
-        }
 
-        // 停止
-        function stopVideo() {
-            destroyPlayer();
-            const container = document.getElementById('player-container');
-            container.innerHTML = '<div class="no-signal">NO SIGNAL</div>';
-        }
+                showStatus('LOADING...');
 
-        // メッセージを受信
-        window.addEventListener('message', function(event) {
-            const data = event.data;
-            
-            if (data.action === 'play') {
-                playVideo(data.url);
-            } else if (data.action === 'stop') {
-                stopVideo();
-            } else if (data.action === 'volume') {
-                setVolume(data.volume);
+                try {
+                    if (media.platform === 'youtube') {
+                        await loadYouTubeApi();
+                        if (token !== playToken) return;
+                        startYouTube(media, token);
+                    } else {
+                        await loadTwitchApi();
+                        if (token !== playToken) return;
+                        startTwitch(media, token);
+                    }
+                } catch (err) {
+                    console.log('Play error:', err);
+                    if (token !== playToken) return;
+                    destroyPlayer();
+                    const name = media.platform === 'youtube' ? 'YouTube' : 'Twitch';
+                    showError(name + ' のプレイヤーを読み込めませんでした。ネットワークを確認してください');
+                }
             }
-        });
 
-        // ページ読み込み完了を通知
-        document.addEventListener('DOMContentLoaded', function() {
-            // DUIからのpostMessage用
-            if (window.invokeNative) {
-                console.log('DUI Player Ready');
+            function setVolume(volume) {
+                const value = Number(volume);
+                if (!Number.isFinite(value)) return;
+                currentVolume = Math.max(0, Math.min(100, Math.round(value)));
+
+                if (!player) return;
+
+                try {
+                    if (playerType === 'youtube' && player.setVolume) {
+                        player.setVolume(currentVolume);
+                        if (currentVolume > 0) player.unMute();
+                    } else if (playerType === 'twitch' && player.setVolume) {
+                        player.setVolume(currentVolume / 100);
+                        player.setMuted(currentVolume === 0);
+                    }
+                } catch (e) {
+                    console.log('Error setting volume:', e);
+                }
             }
-        });
+
+            function stopVideo() {
+                playToken++;
+                destroyPlayer();
+                showStatus('NO SIGNAL');
+            }
+
+            // ---------- メッセージ受信（Lua → DUI） ----------
+
+            window.addEventListener('message', function (event) {
+                // 子 iframe（YouTube / Twitch）からのメッセージは受け付けない
+                if (event.source && event.source !== window) return;
+
+                let data = event.data;
+                if (typeof data === 'string') {
+                    try {
+                        data = JSON.parse(data);
+                    } catch (e) {
+                        return;
+                    }
+                }
+                if (!data || typeof data !== 'object') return;
+
+                if (data.action === 'play') {
+                    playMedia(data.media);
+                } else if (data.action === 'stop') {
+                    stopVideo();
+                } else if (data.action === 'volume') {
+                    setVolume(data.volume);
+                }
+            });
+
+            // 準備完了を Lua に知らせる
+            notifyLua('duiReady', {});
+        })();
     </script>
 </body>
 </html>

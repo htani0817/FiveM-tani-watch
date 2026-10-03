@@ -1,300 +1,573 @@
-local isOpen = false
-local isPlaying = false
-local NEARBY_DISTANCE = 50.0
+-- tani-watch クライアントスクリプト
+-- DUI で動画を描画し、NUI（html/index.html）で操作画面を出す
 
--- DUI関連
-local duiObject = nil
-local duiBrowser = nil
-local duiIsReady = false
-local txd = nil
-local txn = 'tani_watch_txd'
-local duiWidth = 1280
-local duiHeight = 720
+-- ================== 状態 ==================
+
+local isOpen = false        -- NUI（入力画面 / 視聴画面）を開いているか
+local isPlaying = false     -- 動画を再生中か
+local playSeq = 0           -- 再生要求の通し番号（待機中に閉じられた要求を捨てるために使う）
 local currentVolume = 50
 
--- DUIを作成
-function CreateDuiPlayer()
-    if duiObject then return end
-    
-    local url = "https://cfx-nui-tani-watch/html/player.html"
-    duiObject = CreateDui(url, duiWidth, duiHeight)
-    
-    -- テクスチャを作成
-    txd = CreateRuntimeTxd('tani_watch_dict')
-    local duiHandle = GetDuiHandle(duiObject)
-    CreateRuntimeTextureFromDuiHandle(txd, txn, duiHandle)
-    
-    duiIsReady = true
-    print("[tani-watch] DUI Player created")
+-- DUI
+local duiObject = nil
+local duiPageReady = false  -- player.html が準備完了を通知した（または待ち時間を過ぎた）か
+local runtimeTxd = nil
+local TXD_NAME = 'tani_watch_dict'
+local TEXTURE_NAME = 'tani_watch_txd'
+
+-- 共有の受信
+local KVP_RECEIVE = 'tani-watch:receiveShare'
+local receiveEnabled = GetResourceKvpString(KVP_RECEIVE) ~= '0' -- 未設定なら受け取る
+local blockedSenders = {}   -- [送信者のサーバーID] = true（再接続するまで有効）
+local pendingShare = nil    -- 承諾待ちの共有 { media, from, fromId, seq }
+local lastSender = nil      -- 最後に共有してきた人 { id, name }
+local shareRequestSeq = 0
+
+-- ================== 共通 ==================
+
+-- NUI にトーストを出す（kind: 'info' | 'success' | 'error'）
+local function toast(kind, message)
+    SendNUIMessage({ action = 'toast', kind = kind, message = message })
 end
 
--- DUIを破棄
-function DestroyDuiPlayer()
+local function clampVolume(value)
+    value = tonumber(value)
+    if not value then
+        return currentVolume
+    end
+    return math.floor(math.max(0, math.min(100, value)))
+end
+
+-- NUI コールバックの登録。例外が出ても必ず応答を返す
+local function registerCallback(name, handler)
+    RegisterNUICallback(name, function(data, cb)
+        local ok, result = pcall(handler, type(data) == 'table' and data or {})
+        if not ok then
+            print(('[tani-watch] callback %s error: %s'):format(name, tostring(result)))
+            cb({ success = false, message = '内部エラーが発生しました' })
+            return
+        end
+        if result == nil then
+            result = 'ok'
+        end
+        cb(result)
+    end)
+end
+
+-- ================== DUI ==================
+
+local function createDui()
+    if duiObject then
+        return true
+    end
+
+    -- リソース名を直書きせず、実行中のリソース名から作る
+    local url = ('https://cfx-nui-%s/html/player.html'):format(GetCurrentResourceName())
+    local object = CreateDui(url, Config.DuiWidth, Config.DuiHeight)
+    if not object then
+        return false
+    end
+
+    duiObject = object
+    duiPageReady = false
+
+    -- テクスチャ辞書は1回だけ作る（同名の再作成を避ける）
+    if not runtimeTxd then
+        runtimeTxd = CreateRuntimeTxd(TXD_NAME)
+    end
+    CreateRuntimeTextureFromDuiHandle(runtimeTxd, TEXTURE_NAME, GetDuiHandle(duiObject))
+
+    TaniWatch.Log('DUI Player created')
+    return true
+end
+
+local function destroyDui()
     if duiObject then
         DestroyDui(duiObject)
         duiObject = nil
-        duiIsReady = false
-        print("[tani-watch] DUI Player destroyed")
+        duiPageReady = false
+        TaniWatch.Log('DUI Player destroyed')
     end
 end
 
--- DUIにメッセージを送信
-function SendDuiAction(action, data)
-    if not duiObject then return end
-    
+-- DUI の準備ができるまで待つ。間に合わなければ false
+local function waitForDui()
+    local deadline = GetGameTimer() + Config.DuiReadyTimeoutMs
+
+    -- ブラウザの生成を待つ
+    while duiObject and not IsDuiAvailable(duiObject) do
+        if GetGameTimer() > deadline then
+            return false
+        end
+        Wait(0)
+    end
+    if not duiObject then
+        return false
+    end
+
+    -- ページ側の準備完了通知（duiReady）を待つ。通知が届かない環境でも一定時間で進む
+    local graceDeadline = GetGameTimer() + 1500
+    while not duiPageReady and GetGameTimer() < graceDeadline do
+        Wait(0)
+    end
+    duiPageReady = true
+
+    return duiObject ~= nil
+end
+
+local function sendDuiAction(action, data)
+    if not duiObject then
+        return
+    end
+
     local message = { action = action }
     if data then
-        for k, v in pairs(data) do
-            message[k] = v
+        for key, value in pairs(data) do
+            message[key] = value
         end
     end
-    
     SendDuiMessage(duiObject, json.encode(message))
 end
 
--- DUIで動画を再生
-function PlayDuiVideo(url)
-    if not duiObject then
-        CreateDuiPlayer()
-        Citizen.Wait(500) -- DUIの初期化を待つ
-    end
-    
-    SendDuiAction('play', { url = url })
-    isPlaying = true
-end
-
--- DUIの動画を停止
-function StopDuiVideo()
-    SendDuiAction('stop')
+local function stopDuiVideo()
+    sendDuiAction('stop')
     isPlaying = false
 end
 
--- DUIの音量を設定
-function SetDuiVolume(volume)
-    currentVolume = volume
-    SendDuiAction('volume', { volume = volume })
+-- ================== 画面の状態遷移 ==================
+
+-- 入力画面: キーボードもマウスも NUI が使う
+-- 視聴画面: 設定により、キーボードはゲームへ渡す（歩く・運転するなどができる）
+local function applyFocus(screen)
+    SetNuiFocus(true, true)
+    SetNuiFocusKeepInput(screen == 'player' and Config.AllowGameInputWhileWatching == true)
 end
 
--- /watch コマンドを登録
-RegisterCommand('watch', function(source, args, rawCommand)
+-- 動画を再生して視聴画面へ進む。成功で true、失敗で false とエラーメッセージ
+local function startPlayback(media)
+    playSeq = playSeq + 1
+    local seq = playSeq
+
+    if not createDui() then
+        return false, '動画プレイヤーを作成できませんでした'
+    end
+    if not waitForDui() then
+        return false, '動画プレイヤーの準備が間に合いませんでした。もう一度お試しください'
+    end
+    if seq ~= playSeq then
+        return false, '再生が中断されました'
+    end
+
+    sendDuiAction('volume', { volume = currentVolume })
+    sendDuiAction('play', { media = { platform = media.platform, kind = media.kind, id = media.id } })
+
+    isOpen = true
+    isPlaying = true
+    applyFocus('player')
+    SendNUIMessage({ action = 'showPlayer', platform = media.platform })
+    return true
+end
+
+local function openUrlInput()
     if isOpen then
         return
     end
-    
-    OpenUrlInput()
-end, false)
 
--- URL入力UIを開く
-function OpenUrlInput()
     isOpen = true
-    
-    -- DUIを事前に作成
-    if not duiObject then
-        CreateDuiPlayer()
-    end
-    
-    SetNuiFocus(true, true)
+    createDui() -- 先に作っておいて、再生開始までの待ち時間を短くする
+    applyFocus('input')
     SendNUIMessage({
-        action = "openInput"
+        action = 'openInput',
+        receiveEnabled = receiveEnabled,
+        maxTargets = Config.MaxShareTargets,
     })
 end
 
--- プレイヤーを閉じる
-function ClosePlayer()
-    if isOpen or isPlaying then
-        isOpen = false
-        isPlaying = false
-        SetNuiFocus(false, false)
-        SendNUIMessage({
-            action = "close"
-        })
-        StopDuiVideo()
+local function closePlayer()
+    playSeq = playSeq + 1
+    if not (isOpen or isPlaying) then
+        return
     end
+
+    isOpen = false
+    isPlaying = false
+    SetNuiFocusKeepInput(false)
+    SetNuiFocus(false, false)
+    SendNUIMessage({ action = 'close' })
+    stopDuiVideo()
 end
 
--- NUIからのコールバック（閉じる）
-RegisterNUICallback('close', function(data, cb)
-    ClosePlayer()
-    cb('ok')
+local function backToInput()
+    playSeq = playSeq + 1
+    stopDuiVideo()
+    isOpen = true
+    applyFocus('input')
+    SendNUIMessage({ action = 'showInput' })
+end
+
+-- ================== コマンド ==================
+
+RegisterCommand('watch', function()
+    openUrlInput()
+end, false)
+
+-- ================== NUI コールバック ==================
+
+registerCallback('close', function()
+    closePlayer()
 end)
 
--- NUIからのコールバック（動画再生）
-RegisterNUICallback('playVideo', function(data, cb)
-    local url = data.url
-    print("[tani-watch] playVideo called with URL: " .. tostring(url))
-    
-    if not url or url == "" then
-        cb({ success = false, message = "URLを入力してください" })
-        return
+registerCallback('playVideo', function(data)
+    local media, reason = TaniWatch.ParseMedia(data.url)
+    if not media then
+        return { success = false, message = reason }
     end
-    
-    -- YouTube または Twitch のURLかチェック
-    local isYouTube = string.find(url, "youtube.com") or string.find(url, "youtu.be")
-    local isTwitch = string.find(url, "twitch.tv") or string.find(url, "clips.twitch.tv")
-    
-    if not isYouTube and not isTwitch then
-        cb({ success = false, message = "YouTubeまたはTwitchのURLを入力してください" })
-        return
+
+    local ok, err = startPlayback(media)
+    if not ok then
+        return { success = false, message = err }
     end
-    
-    -- DUIで再生
-    PlayDuiVideo(url)
-    
-    print("[tani-watch] Success: Playing video via DUI")
-    cb({ success = true })
+    return { success = true, platform = media.platform }
 end)
 
--- NUIからのコールバック（音量変更）
-RegisterNUICallback('volumeChange', function(data, cb)
-    local volume = data.volume or 50
-    SetDuiVolume(volume)
-    cb('ok')
+registerCallback('volumeChange', function(data)
+    currentVolume = clampVolume(data.volume)
+    sendDuiAction('volume', { volume = currentVolume })
 end)
 
--- NUIからのコールバック（動画停止）
-RegisterNUICallback('stopVideo', function(data, cb)
-    StopDuiVideo()
-    cb('ok')
+registerCallback('backToInput', function()
+    backToInput()
 end)
 
--- NUIからのコールバック（入力画面に戻る）
-RegisterNUICallback('backToInput', function(data, cb)
-    StopDuiVideo()
-    isPlaying = false
-    cb('ok')
+-- プレイヤー画面の準備完了通知（DUI → Lua）
+registerCallback('duiReady', function()
+    duiPageReady = true
 end)
 
--- ================== 画面共有機能 ==================
+-- プレイヤー画面のエラー通知（DUI → Lua）。画面にも表示されるので、トーストでも知らせる
+registerCallback('duiStatus', function(data)
+    if type(data.message) == 'string' and #data.message <= 120 then
+        toast('error', data.message)
+    end
+end)
 
-function GetNearbyPlayers()
+-- ================== 画面共有（送信） ==================
+
+local function getNearbyPlayers()
     local players = {}
-    local myPed = PlayerPedId()
-    local myCoords = GetEntityCoords(myPed)
     local myPlayerId = PlayerId()
-    
+    local myCoords = GetEntityCoords(PlayerPedId())
+
     for _, playerId in ipairs(GetActivePlayers()) do
         if playerId ~= myPlayerId then
-            local targetPed = GetPlayerPed(playerId)
-            local targetCoords = GetEntityCoords(targetPed)
-            local distance = #(myCoords - targetCoords)
-            
-            if distance <= NEARBY_DISTANCE then
-                local playerName = GetPlayerName(playerId)
-                local serverId = GetPlayerServerId(playerId)
-                
-                table.insert(players, {
-                    id = serverId,
-                    name = playerName,
-                    distance = distance
-                })
+            local ped = GetPlayerPed(playerId)
+            if ped and ped ~= 0 and DoesEntityExist(ped) then
+                local distance = #(myCoords - GetEntityCoords(ped))
+                if distance <= Config.NearbyDistance then
+                    players[#players + 1] = {
+                        id = GetPlayerServerId(playerId),
+                        name = TaniWatch.SanitizeName(GetPlayerName(playerId)),
+                        distance = distance,
+                    }
+                end
             end
         end
     end
-    
+
     table.sort(players, function(a, b)
         return a.distance < b.distance
     end)
-    
+
     return players
 end
 
-RegisterNUICallback('getNearbyPlayers', function(data, cb)
-    local players = GetNearbyPlayers()
-    
-    SendNUIMessage({
-        action = "updateNearbyPlayers",
-        players = players
-    })
-    
-    cb('ok')
+-- NUI から届いた共有先を、数値・重複なし・人数上限内に整える
+local function sanitizeTargets(raw)
+    local targets = {}
+    local seen = {}
+    if type(raw) ~= 'table' then
+        return targets
+    end
+
+    for _, value in ipairs(raw) do
+        local id = tonumber(value)
+        if id and id > 0 and id == math.floor(id) and not seen[id] then
+            seen[id] = true
+            targets[#targets + 1] = math.floor(id)
+            if #targets >= Config.MaxShareTargets then
+                break
+            end
+        end
+    end
+    return targets
+end
+
+registerCallback('getNearbyPlayers', function()
+    return { players = getNearbyPlayers() }
 end)
 
-RegisterNUICallback('shareVideo', function(data, cb)
-    local url = data.url
-    local targetPlayers = data.targetPlayers
-    
-    if not url or url == "" then
-        cb({ success = false, message = "URLがありません" })
-        return
+registerCallback('shareVideo', function(data)
+    local media, reason = TaniWatch.ParseMedia(data.url)
+    if not media then
+        return { success = false, message = reason }
     end
-    
-    if not targetPlayers or #targetPlayers == 0 then
-        cb({ success = false, message = "共有先が選択されていません" })
-        return
+
+    local targets = sanitizeTargets(data.targetPlayers)
+    if #targets == 0 then
+        return { success = false, message = '共有先が選択されていません' }
     end
-    
-    local myName = GetPlayerName(PlayerId())
-    local myServerId = GetPlayerServerId(PlayerId())
-    
-    print("[tani-watch] Sharing video to " .. #targetPlayers .. " players")
-    
-    TriggerServerEvent('tani-watch:shareVideo', url, targetPlayers, myName, myServerId)
-    
-    cb({ success = true })
+
+    -- 共有した本人も同じ動画を再生する
+    local ok, err = startPlayback(media)
+    if not ok then
+        return { success = false, message = err }
+    end
+
+    TriggerServerEvent('tani-watch:shareVideo', media.url, targets)
+    return { success = true, platform = media.platform }
 end)
 
-RegisterNetEvent('tani-watch:receiveShare')
-AddEventHandler('tani-watch:receiveShare', function(url, fromPlayerName, fromPlayerId)
-    print("[tani-watch] Received share from " .. fromPlayerName)
-    
-    isOpen = true
-    isPlaying = true
-    
-    -- DUIを作成して再生
-    if not duiObject then
-        CreateDuiPlayer()
-        Citizen.Wait(500)
+-- サーバーからの送信結果
+RegisterNetEvent('tani-watch:shareResult', function(sent, skipped)
+    sent = tonumber(sent) or 0
+    skipped = tonumber(skipped) or 0
+
+    local message = ('%d人に共有リクエストを送りました'):format(sent)
+    if skipped > 0 then
+        message = message .. ('（%d人は離れた・退出のため除外）'):format(skipped)
     end
-    PlayDuiVideo(url)
-    
-    SetNuiFocus(true, true)
-    
-    SendNUIMessage({
-        action = "receiveShare",
-        url = url,
-        fromPlayer = fromPlayerName
-    })
+    toast('success', message)
 end)
+
+-- サーバーからの通知（検証エラーなど）
+RegisterNetEvent('tani-watch:notify', function(kind, message)
+    if type(message) ~= 'string' then
+        return
+    end
+    toast(kind == 'error' and 'error' or 'info', message)
+end)
+
+-- 受信者の応答
+RegisterNetEvent('tani-watch:shareReply', function(name, status)
+    if type(name) ~= 'string' or type(status) ~= 'string' then
+        return
+    end
+
+    if status == 'accepted' then
+        toast('success', ('%sさんが視聴を開始しました'):format(name))
+    elseif status == 'declined' then
+        toast('info', ('%sさんは共有を辞退しました'):format(name))
+    elseif status == 'timeout' then
+        toast('info', ('%sさんから応答がありませんでした'):format(name))
+    elseif status == 'invalid' then
+        toast('error', ('%sさんの環境で再生できませんでした'):format(name))
+    end
+end)
+
+-- ================== 画面共有（受信） ==================
+
+local function respondShare(status)
+    TriggerServerEvent('tani-watch:shareResponse', status)
+end
+
+-- 共有された動画を再生し、結果を送信者へ返す
+local function beginSharedPlayback(share)
+    CreateThread(function()
+        local ok, err = startPlayback(share.media)
+        if ok then
+            respondShare('accepted')
+            toast('success', ('%sさんが共有した動画を再生します'):format(share.from))
+        else
+            respondShare('invalid')
+            toast('error', err or '共有された動画を再生できませんでした')
+        end
+    end)
+end
+
+local function acceptPendingShare()
+    local share = pendingShare
+    if not share then
+        return
+    end
+
+    pendingShare = nil
+    SendNUIMessage({ action = 'shareRequestEnd' })
+    beginSharedPlayback(share)
+end
+
+local function declinePendingShare(status)
+    local share = pendingShare
+    if not share then
+        return
+    end
+
+    pendingShare = nil
+    SendNUIMessage({ action = 'shareRequestEnd' })
+    respondShare(status or 'declined')
+end
+
+local function setReceiveEnabled(enabled)
+    receiveEnabled = enabled == true
+    SetResourceKvp(KVP_RECEIVE, receiveEnabled and '1' or '0')
+    if not receiveEnabled then
+        declinePendingShare('declined')
+    end
+end
+
+-- サーバー経由で届いた共有。承諾確認なしに再生や画面の奪取はしない
+RegisterNetEvent('tani-watch:receiveShare', function(url, fromName, fromId)
+    fromName = type(fromName) == 'string' and TaniWatch.SanitizeName(fromName) or '不明'
+    fromId = tonumber(fromId)
+
+    -- 受け取る側でも検証し、正規化したURLだけを使う
+    local media = TaniWatch.ParseMedia(url)
+    if not media then
+        respondShare('invalid')
+        return
+    end
+
+    if not receiveEnabled or (fromId and blockedSenders[fromId]) then
+        respondShare('declined')
+        return
+    end
+
+    lastSender = { id = fromId, name = fromName }
+
+    if not Config.RequireAcceptance then
+        beginSharedPlayback({ media = media, from = fromName, fromId = fromId })
+        return
+    end
+
+    shareRequestSeq = shareRequestSeq + 1
+    local seq = shareRequestSeq
+    pendingShare = { media = media, from = fromName, fromId = fromId, seq = seq }
+
+    SendNUIMessage({
+        action = 'shareRequest',
+        from = fromName,
+        platform = media.platform,
+        timeoutMs = Config.ShareRequestTimeoutMs,
+        acceptKey = Config.AcceptKey,
+        declineKey = Config.DeclineKey,
+    })
+
+    -- 時間切れは辞退扱い
+    SetTimeout(Config.ShareRequestTimeoutMs, function()
+        if pendingShare and pendingShare.seq == seq then
+            declinePendingShare('timeout')
+        end
+    end)
+end)
+
+registerCallback('acceptShare', function()
+    acceptPendingShare()
+end)
+
+registerCallback('declineShare', function()
+    declinePendingShare('declined')
+end)
+
+registerCallback('setReceiveShare', function(data)
+    setReceiveEnabled(data.enabled)
+end)
+
+-- キー操作（NUI にフォーカスが無いとき用。変更は FiveM のキー設定から）
+RegisterCommand('tani-watch-accept', function()
+    acceptPendingShare()
+end, false)
+
+RegisterCommand('tani-watch-decline', function()
+    declinePendingShare('declined')
+end, false)
+
+RegisterKeyMapping('tani-watch-accept', '共有された動画を視聴する', 'keyboard', Config.AcceptKey)
+RegisterKeyMapping('tani-watch-decline', '共有された動画を辞退する', 'keyboard', Config.DeclineKey)
+
+-- 共有の受信を切り替える
+RegisterCommand('watchdnd', function()
+    setReceiveEnabled(not receiveEnabled)
+    toast('info', receiveEnabled and '共有の受信をオンにしました' or '共有の受信をオフにしました')
+end, false)
+
+-- 最後に共有してきた人をブロックする（再接続するまで有効）
+RegisterCommand('watchblock', function()
+    if not lastSender or not lastSender.id then
+        toast('info', 'ブロックできる送信者がいません')
+        return
+    end
+
+    blockedSenders[lastSender.id] = true
+    if pendingShare and pendingShare.fromId == lastSender.id then
+        declinePendingShare('declined')
+    end
+    toast('success', ('%sさんからの共有をブロックしました（再接続するまで有効）'):format(lastSender.name))
+end, false)
 
 -- ================== 描画スレッド ==================
 
--- DUIをスクリーンに描画
-Citizen.CreateThread(function()
+-- DUI をスクリーンに描画（再生中だけ毎フレーム回す）
+CreateThread(function()
     while true do
-        Citizen.Wait(0)
-        
-        if isPlaying and duiObject and duiIsReady then
-            -- 画面中央に動画を表示（16:9のアスペクト比）
-            local screenW, screenH = 0.7, 0.7 * (9/16) -- 画面の70%幅
-            local screenX, screenY = 0.5, 0.45 -- 少し上寄り
-            
+        if isPlaying and duiObject then
+            Wait(0)
+
+            -- 16:9 の動画を、画面の縦横比に合わせて歪まないように描く
+            local aspect = GetAspectRatio(false)
+            local width = 0.7
+            local height = width * aspect * 9 / 16
+            if height > 0.8 then
+                height = 0.8
+                width = height * 16 / (9 * aspect)
+            end
+
             SetScriptGfxDrawBehindPausemenu(true)
-            DrawSprite('tani_watch_dict', txn, screenX, screenY, screenW, screenH, 0.0, 255, 255, 255, 255)
+            DrawSprite(TXD_NAME, TEXTURE_NAME, 0.5, 0.45, width, height, 0.0, 255, 255, 255, 255)
             SetScriptGfxDrawBehindPausemenu(false)
+        else
+            Wait(100)
         end
     end
 end)
 
 -- ================== キー入力処理 ==================
 
-Citizen.CreateThread(function()
+-- ESC で閉じる（キーボードがゲームへ渡っているとき用。NUI にフォーカスがあるときは JS 側で閉じる）
+CreateThread(function()
     while true do
-        Citizen.Wait(0)
         if isOpen then
+            Wait(0)
             DisableControlAction(0, 200, true) -- ESC
             if IsDisabledControlJustReleased(0, 200) then
-                ClosePlayer()
+                closePlayer()
             end
+        else
+            Wait(250)
         end
     end
 end)
 
--- リソース停止時にクリーンアップ
+-- ================== 後始末・登録 ==================
+
+-- リソース停止時にクリーンアップ（入力フォーカスも必ず解除する）
 AddEventHandler('onResourceStop', function(resourceName)
-    if GetCurrentResourceName() == resourceName then
-        DestroyDuiPlayer()
+    if GetCurrentResourceName() ~= resourceName then
+        return
     end
+
+    SetNuiFocusKeepInput(false)
+    SetNuiFocus(false, false)
+    destroyDui()
 end)
 
--- ヘルプメッセージ
-TriggerEvent('chat:addSuggestion', '/watch', 'YouTube/Twitchのビデオを視聴・共有')
+-- チャットのコマンド候補（chat がまだ起動していない場合に備え、chat の起動時にも登録する）
+local function registerSuggestions()
+    TriggerEvent('chat:addSuggestion', '/watch', 'YouTube/Twitchのビデオを視聴・共有')
+    TriggerEvent('chat:addSuggestion', '/watchdnd', '動画共有の受信をオン/オフにする')
+    TriggerEvent('chat:addSuggestion', '/watchblock', '最後に共有してきた人をブロックする')
+end
+
+AddEventHandler('onClientResourceStart', function(resourceName)
+    if resourceName == GetCurrentResourceName() or resourceName == 'chat' then
+        registerSuggestions()
+    end
+end)

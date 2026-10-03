@@ -5,6 +5,7 @@ const pasteBtn = document.getElementById('paste-btn');
 const playBtn = document.getElementById('play-btn');
 const inputCloseBtn = document.getElementById('input-close-btn');
 const errorMessage = document.getElementById('error-message');
+const receiveToggle = document.getElementById('receive-toggle');
 
 // DOM要素 - 画面共有
 const shareBtn = document.getElementById('share-btn');
@@ -12,6 +13,8 @@ const playerListContainer = document.getElementById('player-list-container');
 const playerList = document.getElementById('player-list');
 const playerCount = document.getElementById('player-count');
 const shareConfirmBtn = document.getElementById('share-confirm-btn');
+const selectAllBtn = document.getElementById('select-all-btn');
+const refreshBtn = document.getElementById('refresh-btn');
 
 // DOM要素 - プレイヤー画面
 const playerContainer = document.getElementById('player-container');
@@ -24,89 +27,173 @@ const volumeValue = document.getElementById('volume-value');
 const volumeIcon = document.getElementById('volume-icon');
 const platformBadge = document.getElementById('platform-badge');
 
+// DOM要素 - 共有の承諾確認・トースト
+const shareRequest = document.getElementById('share-request');
+const shareRequestText = document.getElementById('share-request-text');
+const shareRequestHint = document.getElementById('share-request-hint');
+const shareRequestBar = document.getElementById('share-request-bar');
+const shareRequestAccept = document.getElementById('share-request-accept');
+const shareRequestDecline = document.getElementById('share-request-decline');
+const toastContainer = document.getElementById('toast-container');
+
+// リソース名は直書きせず、NUI が持っている名前を使う
+const RESOURCE_NAME = typeof GetParentResourceName === 'function' ? GetParentResourceName() : 'tani-watch';
+
+const POST_TIMEOUT_MS = 15000;       // 再生開始は DUI の準備待ちを含むので長めに取る
+const PLAYER_LIST_REFRESH_MS = 2000; // 付近プレイヤー一覧の自動更新間隔
+const MAX_TOASTS = 4;
+
+const SELECT_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+const TOAST_ICONS = {
+    info: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>',
+    success: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>',
+    error: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
+};
+
+const CLOSE_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+
 let currentVolume = 50;
 let isMuted = false;
 let previousVolume = 50;
 let selectedPlayers = new Set();
 let nearbyPlayers = [];
+let nearbyListSignature = '';
+let nearbyRequestInFlight = false;
+let playerListTimer = null;
 let isPlayerListOpen = false;
-let currentPlatform = 'youtube';
+let maxTargets = 10;
+let screen = 'none'; // 'none' | 'input' | 'player'
+let isBusy = false;
+let volumeSendTimer = null;
+
+// ================== Lua との通信 ==================
+
+// NUI コールバックを呼ぶ。タイムアウトや通信エラーは例外で返す
+async function post(name, body, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs || POST_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(`https://${RESOURCE_NAME}/${name}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+            body: JSON.stringify(body || {}),
+            signal: controller.signal
+        });
+        if (!response.ok) {
+            throw new Error(`${name}: HTTP ${response.status}`);
+        }
+
+        const text = await response.text();
+        try {
+            return JSON.parse(text);
+        } catch (e) {
+            return text;
+        }
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// 結果を待たない通知（失敗してもコンソールに残すだけ）
+function postQuiet(name, body) {
+    post(name, body, 5000).catch(err => console.warn(`${name} failed:`, err));
+}
+
+// 閉じる・戻るのように、失敗したら利用者に知らせるべき操作
+async function postAction(name) {
+    try {
+        await post(name, {}, 5000);
+    } catch (err) {
+        console.warn(`${name} failed:`, err);
+        showToast('error', '操作に失敗しました。もう一度お試しください');
+    }
+}
 
 // FiveMからのメッセージを受信
 window.addEventListener('message', function(event) {
     const data = event.data;
+    if (!data || typeof data !== 'object') {
+        return;
+    }
 
-    if (data.action === 'openInput') {
-        showInputScreen();
-        requestNearbyPlayers();
-    } else if (data.action === 'close') {
-        closeAll();
-    } else if (data.action === 'updateNearbyPlayers') {
-        updateNearbyPlayersList(data.players);
-    } else if (data.action === 'receiveShare') {
-        showSharedVideo(data.url, data.fromPlayer);
+    switch (data.action) {
+        case 'openInput':
+            showInputScreen(data);
+            break;
+        case 'showInput':
+            showInputScreen({ reset: false });
+            break;
+        case 'showPlayer':
+            showPlayerScreen(data.platform);
+            break;
+        case 'close':
+            closeAll();
+            break;
+        case 'toast':
+            showToast(data.kind, data.message);
+            break;
+        case 'shareRequest':
+            showShareRequest(data);
+            break;
+        case 'shareRequestEnd':
+            hideShareRequest();
+            break;
     }
 });
 
-// 付近プレイヤーを要求
-function requestNearbyPlayers() {
-    fetch('https://tani-watch/getNearbyPlayers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
-}
+// ESC で閉じる（NUI にフォーカスがあるとゲーム側はキーを受け取れないため、ここで処理する）
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape' || e.repeat || screen === 'none') {
+        return;
+    }
+    e.preventDefault();
+    postAction('close');
+});
+
+// ================== 画面の切り替え ==================
 
 // URL入力画面を表示
-function showInputScreen() {
+function showInputScreen(options) {
+    const opts = options || {};
+    screen = 'input';
     inputContainer.classList.remove('hidden');
     playerContainer.classList.add('hidden');
-    urlInput.value = '';
-    errorMessage.classList.add('hidden');
+
+    if (opts.reset !== false) {
+        urlInput.value = '';
+        hideError();
+    }
+    if (typeof opts.receiveEnabled === 'boolean') {
+        receiveToggle.checked = opts.receiveEnabled;
+    }
+    if (Number.isInteger(opts.maxTargets) && opts.maxTargets > 0) {
+        maxTargets = opts.maxTargets;
+    }
+
     hidePlayerList();
     urlInput.focus();
 }
 
 // プレイヤー画面を表示
-function showPlayerScreen(url) {
-    const platform = detectPlatform(url);
-    currentPlatform = platform;
-    updatePlatformBadge(platform);
+function showPlayerScreen(platform) {
+    screen = 'player';
+    updatePlatformBadge(platform === 'twitch' ? 'twitch' : 'youtube');
+    hidePlayerList();
     inputContainer.classList.add('hidden');
     playerContainer.classList.remove('hidden');
 }
 
-// プラットフォームを検出
-function detectPlatform(url) {
-    if (url.includes('twitch.tv') || url.includes('clips.twitch.tv')) {
-        return 'twitch';
-    }
-    return 'youtube';
-}
-
 // 全て閉じる
 function closeAll() {
+    screen = 'none';
     inputContainer.classList.add('hidden');
     playerContainer.classList.add('hidden');
     urlInput.value = '';
-    errorMessage.classList.add('hidden');
+    hideError();
     hidePlayerList();
-    removeNotifications();
-}
-
-// URL入力画面に戻る
-function backToInput() {
-    playerContainer.classList.add('hidden');
-    inputContainer.classList.remove('hidden');
-    requestNearbyPlayers();
-    urlInput.focus();
-    
-    // Luaに停止を通知
-    fetch('https://tani-watch/stopVideo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
+    setBusy(false);
 }
 
 // プラットフォームバッジを更新
@@ -115,67 +202,57 @@ function updatePlatformBadge(platform) {
     platformBadge.textContent = platform === 'twitch' ? 'Twitch' : 'YouTube';
 }
 
-// エラーを表示
+// ================== エラー・処理中の表示 ==================
+
 function showError(message) {
     errorMessage.textContent = message;
     errorMessage.classList.remove('hidden');
 }
 
-// エラーを非表示
 function hideError() {
     errorMessage.classList.add('hidden');
 }
 
-// URLを検証
-function validateUrl(url) {
-    if (!url) {
-        return { valid: false, message: 'URLを入力してください' };
-    }
-    
-    const isYouTube = url.includes('youtube.com') || url.includes('youtu.be');
-    const isTwitch = url.includes('twitch.tv') || url.includes('clips.twitch.tv');
-    
-    if (!isYouTube && !isTwitch) {
-        return { valid: false, message: 'YouTubeまたはTwitchのURLを入力してください' };
-    }
-    
-    return { valid: true };
+// 再生・共有の要求中は二重に押せないようにする
+function setBusy(busy) {
+    isBusy = busy;
+    playBtn.disabled = busy;
+    playBtn.classList.toggle('loading', busy);
+    playBtn.querySelector('span').textContent = busy ? '読み込み中…' : '再生';
+    playBtn.setAttribute('aria-busy', String(busy));
+    updateShareButton();
 }
 
-// URLを検証して再生
-function validateAndPlay() {
-    const url = urlInput.value.trim();
-    const validation = validateUrl(url);
-    
-    if (!validation.valid) {
-        showError(validation.message);
+// ================== 再生 ==================
+
+// URLの検証は Lua 側（サーバーと同じ規則）で行う。ここでは空かどうかだけ見る
+async function validateAndPlay() {
+    if (isBusy) {
         return;
     }
-    
+
+    const url = urlInput.value.trim();
+    if (!url) {
+        showError('URLを入力してください');
+        urlInput.focus();
+        return;
+    }
+
     hideError();
-    
-    // サーバーに通知（DUIで再生）
-    fetch('https://tani-watch/playVideo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-    })
-    .then(response => response.text())
-    .then(text => {
-        console.log('Server response:', text);
-        try {
-            const data = JSON.parse(text);
-            if (data.success === false) {
-                showError(data.message || 'エラーが発生しました');
-                return;
-            }
-        } catch (e) {}
-        showPlayerScreen(url);
-    })
-    .catch(err => {
-        console.log('Fetch error:', err);
-        showPlayerScreen(url);
-    });
+    setBusy(true);
+
+    try {
+        const result = await post('playVideo', { url: url });
+        if (!result || result.success !== true) {
+            showError((result && result.message) || '再生できませんでした');
+        }
+        // 成功したときは Lua から showPlayer が届いて画面が切り替わる
+    } catch (err) {
+        console.warn('playVideo failed:', err);
+        showError('再生を開始できませんでした。時間をおいてもう一度お試しください');
+    } finally {
+        setBusy(false);
+    }
 }
 
 // ================== 画面共有機能 ==================
@@ -185,7 +262,6 @@ shareBtn.addEventListener('click', function() {
         hidePlayerList();
     } else {
         showPlayerList();
-        requestNearbyPlayers();
     }
 });
 
@@ -193,149 +269,286 @@ function showPlayerList() {
     isPlayerListOpen = true;
     playerListContainer.classList.remove('hidden');
     shareBtn.classList.add('active');
+    shareBtn.setAttribute('aria-expanded', 'true');
+
+    requestNearbyPlayers();
+    clearInterval(playerListTimer);
+    playerListTimer = setInterval(requestNearbyPlayers, PLAYER_LIST_REFRESH_MS);
 }
 
 function hidePlayerList() {
     isPlayerListOpen = false;
     playerListContainer.classList.add('hidden');
     shareBtn.classList.remove('active');
+    shareBtn.setAttribute('aria-expanded', 'false');
+    clearInterval(playerListTimer);
+    playerListTimer = null;
     selectedPlayers.clear();
+    nearbyListSignature = '';
     updateShareButton();
+}
+
+// 付近プレイヤーを要求
+async function requestNearbyPlayers() {
+    if (nearbyRequestInFlight) {
+        return;
+    }
+    nearbyRequestInFlight = true;
+
+    try {
+        const result = await post('getNearbyPlayers', {}, 5000);
+        if (isPlayerListOpen) {
+            updateNearbyPlayersList(result && result.players);
+        }
+    } catch (err) {
+        console.warn('getNearbyPlayers failed:', err);
+    } finally {
+        nearbyRequestInFlight = false;
+    }
+}
+
+function isValidPlayer(player) {
+    return player
+        && Number.isInteger(player.id)
+        && typeof player.name === 'string'
+        && Number.isFinite(player.distance);
 }
 
 function updateNearbyPlayersList(players) {
-    nearbyPlayers = players || [];
+    nearbyPlayers = Array.isArray(players) ? players.filter(isValidPlayer) : [];
     playerCount.textContent = nearbyPlayers.length + '人';
-    
-    if (nearbyPlayers.length === 0) {
-        playerList.innerHTML = '<div class="no-players">付近にプレイヤーがいません</div>';
-        return;
-    }
-    
-    playerList.innerHTML = nearbyPlayers.map(player => `
-        <div class="player-item ${selectedPlayers.has(player.id) ? 'selected' : ''}" data-id="${player.id}">
-            <div class="player-checkbox">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3">
-                    <polyline points="20 6 9 17 4 12"></polyline>
-                </svg>
-            </div>
-            <div class="player-info">
-                <div class="player-name">${escapeHtml(player.name)}</div>
-                <div class="player-id">ID: ${player.id}</div>
-            </div>
-            <div class="player-distance">${player.distance.toFixed(1)}m</div>
-        </div>
-    `).join('');
-    
-    playerList.querySelectorAll('.player-item').forEach(item => {
-        item.addEventListener('click', function() {
-            const playerId = parseInt(this.dataset.id);
-            togglePlayerSelection(playerId);
-            this.classList.toggle('selected');
-        });
+
+    // 範囲外に出た・退出した人は選択から外す（人数表示とずらさない）
+    const currentIds = new Set(nearbyPlayers.map(player => player.id));
+    selectedPlayers.forEach(id => {
+        if (!currentIds.has(id)) {
+            selectedPlayers.delete(id);
+        }
     });
-    
+
+    // 内容が変わったときだけ描き直す（フォーカスやホバーを保つため）
+    const signature = nearbyPlayers.map(player => `${player.id}:${Math.round(player.distance)}`).join(',');
+    if (signature !== nearbyListSignature) {
+        const focusedId = document.activeElement && document.activeElement.dataset
+            ? document.activeElement.dataset.id
+            : null;
+        nearbyListSignature = signature;
+        renderPlayerList();
+        if (focusedId) {
+            const item = playerList.querySelector(`.player-item[data-id="${CSS.escape(focusedId)}"]`);
+            if (item) {
+                item.focus();
+            }
+        }
+    }
+
     updateShareButton();
 }
 
-function togglePlayerSelection(playerId) {
+// プレイヤー一覧を DOM API で組み立てる（名前は textContent で入れるので HTML として解釈されない）
+function renderPlayerList() {
+    playerList.replaceChildren();
+
+    if (nearbyPlayers.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'no-players';
+        empty.textContent = '付近にプレイヤーがいません';
+        playerList.appendChild(empty);
+        return;
+    }
+
+    nearbyPlayers.forEach(player => {
+        const selected = selectedPlayers.has(player.id);
+
+        const item = document.createElement('div');
+        item.className = 'player-item' + (selected ? ' selected' : '');
+        item.dataset.id = String(player.id);
+        item.tabIndex = 0;
+        item.setAttribute('role', 'checkbox');
+        item.setAttribute('aria-checked', String(selected));
+
+        const checkbox = document.createElement('div');
+        checkbox.className = 'player-checkbox';
+        checkbox.innerHTML = SELECT_ICON;
+
+        const info = document.createElement('div');
+        info.className = 'player-info';
+        const name = document.createElement('div');
+        name.className = 'player-name';
+        name.textContent = player.name;
+        const id = document.createElement('div');
+        id.className = 'player-id';
+        id.textContent = 'ID: ' + player.id;
+        info.append(name, id);
+
+        const distance = document.createElement('div');
+        distance.className = 'player-distance';
+        distance.textContent = player.distance.toFixed(1) + 'm';
+
+        item.append(checkbox, info, distance);
+
+        item.addEventListener('click', () => togglePlayerSelection(player.id, item));
+        item.addEventListener('keydown', e => {
+            if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault();
+                togglePlayerSelection(player.id, item);
+            }
+        });
+
+        playerList.appendChild(item);
+    });
+}
+
+function togglePlayerSelection(playerId, item) {
     if (selectedPlayers.has(playerId)) {
         selectedPlayers.delete(playerId);
     } else {
+        if (selectedPlayers.size >= maxTargets) {
+            showError(`一度に共有できるのは${maxTargets}人までです`);
+            return;
+        }
         selectedPlayers.add(playerId);
     }
+
+    const selected = selectedPlayers.has(playerId);
+    item.classList.toggle('selected', selected);
+    item.setAttribute('aria-checked', String(selected));
     updateShareButton();
 }
 
+// 全員を選ぶ。全員が選ばれているときは全解除
+selectAllBtn.addEventListener('click', function() {
+    // 上限より人数が多いときは、近い順に上限人数までを「全員」として扱う
+    const candidates = nearbyPlayers.slice(0, maxTargets);
+    const allSelected = candidates.length > 0 && candidates.every(player => selectedPlayers.has(player.id));
+
+    selectedPlayers.clear();
+    if (!allSelected) {
+        candidates.forEach(player => selectedPlayers.add(player.id));
+        if (nearbyPlayers.length > maxTargets) {
+            showError(`近い順に${maxTargets}人まで選択しました`);
+        }
+    }
+
+    renderPlayerList();
+    updateShareButton();
+});
+
+refreshBtn.addEventListener('click', requestNearbyPlayers);
+
 function updateShareButton() {
     const count = selectedPlayers.size;
-    if (count === 0) {
-        shareConfirmBtn.disabled = true;
-        shareConfirmBtn.querySelector('span').textContent = '選択したプレイヤーに共有';
-    } else {
-        shareConfirmBtn.disabled = false;
-        shareConfirmBtn.querySelector('span').textContent = `${count}人に共有`;
-    }
+    shareConfirmBtn.disabled = count === 0 || isBusy;
+    shareConfirmBtn.querySelector('span').textContent = count === 0
+        ? '選択したプレイヤーに共有'
+        : `${count}人に共有`;
+    selectAllBtn.disabled = nearbyPlayers.length === 0;
 }
 
-shareConfirmBtn.addEventListener('click', function() {
-    const url = urlInput.value.trim();
-    const validation = validateUrl(url);
-    
-    if (!validation.valid) {
-        showError(validation.message);
+shareConfirmBtn.addEventListener('click', async function() {
+    if (isBusy) {
         return;
     }
-    
+
+    const url = urlInput.value.trim();
+    if (!url) {
+        showError('URLを入力してください');
+        urlInput.focus();
+        return;
+    }
     if (selectedPlayers.size === 0) {
         showError('共有するプレイヤーを選択してください');
         return;
     }
-    
+
     hideError();
-    
-    fetch('https://tani-watch/shareVideo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+    setBusy(true);
+
+    try {
+        const result = await post('shareVideo', {
             url: url,
             targetPlayers: Array.from(selectedPlayers)
-        })
-    })
-    .then(response => response.text())
-    .then(text => {
-        console.log('Share response:', text);
-        showPlayerScreen(url);
-    })
-    .catch(err => {
-        console.log('Share error:', err);
-        showPlayerScreen(url);
-    });
+        });
+        if (!result || result.success !== true) {
+            showError((result && result.message) || '共有できませんでした');
+        }
+        // 成功したときは Lua から showPlayer が届いて画面が切り替わり、結果はトーストで届く
+    } catch (err) {
+        console.warn('shareVideo failed:', err);
+        showError('共有を開始できませんでした。時間をおいてもう一度お試しください');
+    } finally {
+        setBusy(false);
+    }
 });
 
-function showSharedVideo(url, fromPlayer) {
-    showShareNotification(fromPlayer);
-    showPlayerScreen(url);
+// ================== 共有された動画の承諾確認 ==================
+
+function showShareRequest(data) {
+    const from = typeof data.from === 'string' ? data.from : '不明';
+    const platform = data.platform === 'twitch' ? 'Twitch' : 'YouTube';
+    const timeoutMs = Number.isFinite(data.timeoutMs) && data.timeoutMs > 0 ? data.timeoutMs : 15000;
+
+    shareRequestText.textContent = `${from} さんが ${platform} の動画を共有しました`;
+    shareRequestHint.textContent = `キー操作: ${data.acceptKey || 'Y'} で視聴 / ${data.declineKey || 'N'} で辞退（初期設定）`;
+
+    // 残り時間のバーを最初から動かし直す
+    shareRequestBar.style.animation = 'none';
+    void shareRequestBar.offsetWidth;
+    shareRequestBar.style.animation = `shareRequestTimer ${timeoutMs}ms linear forwards`;
+
+    shareRequest.classList.remove('hidden');
 }
 
-function showShareNotification(fromPlayer) {
-    removeNotifications();
-    
-    const notification = document.createElement('div');
-    notification.className = 'share-notification';
-    notification.innerHTML = `
-        <div class="share-notification-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                <circle cx="9" cy="7" r="4"></circle>
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-            </svg>
-        </div>
-        <div class="share-notification-content">
-            <div class="share-notification-title">画面共有を受信</div>
-            <div class="share-notification-text">${escapeHtml(fromPlayer)}さんから</div>
-        </div>
-        <button class="share-notification-close" onclick="this.parentElement.remove()">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-        </button>
-    `;
-    
-    document.body.appendChild(notification);
-    setTimeout(() => notification.remove(), 5000);
+function hideShareRequest() {
+    shareRequest.classList.add('hidden');
 }
 
-function removeNotifications() {
-    document.querySelectorAll('.share-notification').forEach(n => n.remove());
-}
+shareRequestAccept.addEventListener('click', function() {
+    hideShareRequest();
+    postQuiet('acceptShare');
+});
 
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+shareRequestDecline.addEventListener('click', function() {
+    hideShareRequest();
+    postQuiet('declineShare');
+});
+
+// ================== トースト通知 ==================
+
+function showToast(kind, message) {
+    if (typeof message !== 'string' || message === '') {
+        return;
+    }
+
+    const type = kind === 'success' || kind === 'error' ? kind : 'info';
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+    const icon = document.createElement('div');
+    icon.className = 'toast-icon';
+    icon.innerHTML = TOAST_ICONS[type];
+
+    const text = document.createElement('div');
+    text.className = 'toast-text';
+    text.textContent = message;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'toast-close';
+    closeBtn.setAttribute('aria-label', '通知を閉じる');
+    closeBtn.innerHTML = CLOSE_ICON;
+    closeBtn.addEventListener('click', () => toast.remove());
+
+    toast.append(icon, text, closeBtn);
+    toastContainer.appendChild(toast);
+
+    while (toastContainer.children.length > MAX_TOASTS) {
+        toastContainer.firstElementChild.remove();
+    }
+
+    setTimeout(() => toast.remove(), type === 'error' ? 7000 : 5000);
 }
 
 // ================== 基本機能 ==================
@@ -343,51 +556,54 @@ function escapeHtml(text) {
 pasteBtn.addEventListener('click', async function() {
     try {
         const text = await navigator.clipboard.readText();
-        urlInput.value = text;
+        urlInput.value = text.trim();
         hideError();
-    } catch (err) {}
+    } catch (err) {
+        // CEF ではクリップボードの読み取りが拒否されやすい。手動の貼り付けに誘導する
+        showError('クリップボードを読み取れませんでした。入力欄をクリックして Ctrl+V で貼り付けてください');
+    }
+    urlInput.focus();
 });
 
 playBtn.addEventListener('click', validateAndPlay);
 
 urlInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') {
+    // 日本語入力の変換確定の Enter では再生しない
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
         validateAndPlay();
     }
 });
 
 urlInput.addEventListener('input', hideError);
 
+receiveToggle.addEventListener('change', function() {
+    postQuiet('setReceiveShare', { enabled: receiveToggle.checked });
+});
+
 inputCloseBtn.addEventListener('click', function() {
-    fetch('https://tani-watch/close', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
+    postAction('close');
 });
 
 playerCloseBtn.addEventListener('click', function() {
-    fetch('https://tani-watch/close', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
+    postAction('close');
 });
 
 backBtn.addEventListener('click', function() {
-    fetch('https://tani-watch/backToInput', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
-    backToInput();
+    postAction('backToInput');
 });
 
 // 音量スライダー
 volumeSlider.addEventListener('input', function() {
-    currentVolume = parseInt(this.value);
+    currentVolume = parseInt(this.value, 10);
+    if (currentVolume > 0) {
+        // スライダーで音を上げたらミュート解除。次のボタン操作は「ミュート」になる
+        isMuted = false;
+        previousVolume = currentVolume;
+    } else {
+        isMuted = true;
+    }
     updateVolumeUI();
-    sendVolumeToServer();
+    scheduleVolumeSend();
 });
 
 // ミュートボタン
@@ -397,19 +613,19 @@ volumeBtn.addEventListener('click', function() {
         currentVolume = previousVolume || 50;
     } else {
         isMuted = true;
-        previousVolume = currentVolume;
+        previousVolume = currentVolume || previousVolume;
         currentVolume = 0;
     }
-    
+
     volumeSlider.value = currentVolume;
     updateVolumeUI();
-    sendVolumeToServer();
+    scheduleVolumeSend();
 });
 
 function updateVolumeUI() {
     volumeFill.style.width = currentVolume + '%';
     volumeValue.textContent = currentVolume + '%';
-    
+
     if (currentVolume === 0) {
         volumeIcon.innerHTML = `
             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
@@ -433,13 +649,17 @@ function updateVolumeUI() {
     }
 }
 
-function sendVolumeToServer() {
-    fetch('https://tani-watch/volumeChange', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ volume: currentVolume })
-    });
+// ドラッグ中に大量に送らないよう、短い間隔でまとめて最新の値だけ送る
+function scheduleVolumeSend() {
+    if (volumeSendTimer !== null) {
+        return;
+    }
+    volumeSendTimer = setTimeout(function() {
+        volumeSendTimer = null;
+        postQuiet('volumeChange', { volume: currentVolume });
+    }, 80);
 }
 
 // 初期化
 updateVolumeUI();
+updateShareButton();
