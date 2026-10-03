@@ -965,12 +965,13 @@ kbd {
 }
 
 /* ================== トースト通知 ================== */
+/* 動画の外側（右の余白）に積む。動画は画面の幅の約62%（中央）なので、左右の余白は約19%ずつ。
+   余白の幅に収まるよう、狭い画面では細くする。ヘッダーのボタン（戻る・閉じる）の下から始める */
 .toast-container {
     position: fixed;
     top: 76px;
-    right: 20px;
-    width: 340px;
-    max-width: calc(100vw - 32px);
+    right: 16px;
+    width: max(150px, min(220px, calc(19vw - 24px)));
     display: flex;
     flex-direction: column;
     gap: 10px;
