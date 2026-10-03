@@ -75,6 +75,10 @@ button:focus-visible,
 
 .input-wrapper {
     width: 480px;
+    /* 画面が低くても（720pなど）はみ出さないよう、高さを画面内に収めて中身をスクロールさせる */
+    max-height: calc(100vh - 32px);
+    display: flex;
+    flex-direction: column;
     background: linear-gradient(165deg, #1e1e2e 0%, #12121a 100%);
     border-radius: 20px;
     overflow: hidden;
@@ -86,6 +90,7 @@ button:focus-visible,
 }
 
 .input-header {
+    flex-shrink: 0;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -128,7 +133,23 @@ button:focus-visible,
 }
 
 .input-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
     padding: 28px 24px;
+}
+
+.input-body::-webkit-scrollbar {
+    width: 6px;
+}
+
+.input-body::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.input-body::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 3px;
 }
 
 .input-description {
@@ -284,6 +305,7 @@ button:focus-visible,
 }
 
 .input-footer {
+    flex-shrink: 0;
     display: flex;
     justify-content: center;
     align-items: center;
@@ -697,7 +719,7 @@ kbd {
 }
 
 .player-list {
-    max-height: 200px;
+    max-height: min(200px, 28vh);
     overflow-y: auto;
     padding: 8px;
 }

@@ -25,8 +25,9 @@ local function isWithinRange(sourceA, sourceB)
         return true
     end
 
-    local pedA = GetPlayerPed(sourceA)
-    local pedB = GetPlayerPed(sourceB)
+    -- GetPlayerPed はプレイヤーの source を「文字列」で受け取る（公式ドキュメントの仕様）
+    local pedA = GetPlayerPed(tostring(sourceA))
+    local pedB = GetPlayerPed(tostring(sourceB))
     if not pedA or pedA == 0 or not pedB or pedB == 0 then
         return true
     end
