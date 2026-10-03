@@ -110,6 +110,9 @@ URLは「許可したホストと形式に完全一致するもの」だけ受�
 | `Config.ShareRequestTimeoutMs` | `15000` | 承諾確認の待ち時間（ミリ秒） |
 | `Config.AllowGameInputWhileWatching` | `true` | 視聴中もキーボードでのゲーム操作を許可する |
 | `Config.AcceptKey` / `Config.DeclineKey` | `Y` / `N` | 承諾・辞退のキーの初期値 |
+| `Config.VideoWidth` | `0.62` | 動画の幅（画面の幅に対する割合）。縦横比によっては高さの上限で小さくなる |
+| `Config.VideoMaxHeight` | `0.62` | 動画の高さの上限（画面の高さに対する割合） |
+| `Config.VideoCenterY` | `0.55` | 動画の中心の縦位置（0 = 上端、1 = 下端）。上に通知用の余白を残すため中央より少し下 |
 | `Config.MaxUrlLength` | `300` | 受け付けるURLの最大長 |
 | `Config.DuiWidth` / `Config.DuiHeight` | `1280` / `720` | DUI解像度 |
 | `Config.DuiReadyTimeoutMs` | `8000` | DUI の準備を待つ上限（ミリ秒） |
@@ -127,6 +130,22 @@ URLは「許可したホストと形式に完全一致するもの」だけ受�
 **外部サーバーへの通信について**: 動画を再生するとき、プレイヤーのPCが YouTube（`www.youtube.com`）または Twitch（`player.twitch.tv` / `clips.twitch.tv`）へ直接接続します。これらのスクリプトは配信元が更新するため SRI（改ざん検知）は付けられません。動画を再生しない限り外部へは接続しません。UI フォント（Outfit）はリソースに同梱しており、Google Fonts へは接続しません。
 
 **OneSync について**: サーバー側の距離検証は OneSync が有効なサーバーでのみ働きます。サーバーから座標を取れない環境では、距離の検証だけを自動でスキップします（他の検証は常に有効です）。
+
+## YouTube・Twitch の利用について
+
+本リソースは、動画の再生に **YouTube API サービス（IFrame Player API）** と **Twitch の埋め込みプレイヤー** を使います。動画を再生する利用者は、次の規約・ポリシーが適用されます。サーバーのルールにも明記してください。
+
+- YouTube 利用規約: <https://www.youtube.com/t/terms>
+- Google プライバシーポリシー: <https://policies.google.com/privacy>
+- Twitch 利用規約: <https://legal.twitch.com/legal/terms-of-service/>
+- Twitch プライバシーに関する通知: <https://legal.twitch.com/legal/privacy-notice/>
+
+**サーバー運営者の方へ**
+
+- **視聴を有料にしないでください。** YouTube API サービスの利用規約は、埋め込みプレイヤーでの視聴を有料にすることを禁じています（入場券の販売など）。Cfx.re の Creator Platform License Agreement も、商用利用の方法を制限しています
+- **上映するコンテンツの権利は、運営者と視聴者の責任で確認してください。** 権利の確認されていない映画や中継を、サーバーで流す使い方は想定していません
+- 動画の再生を妨げる改変（広告の非表示、プレイヤーの隠蔽、映像と音声の分離、ダウンロードなど）は、YouTube の規約で禁じられています。本リソースは、これらをしていません
+- 通知や共有の確認は、動画の上に重ならないよう、動画の外側（上の余白・右の余白）に出します。YouTube の埋め込み要件（プレイヤーの上に表示物を重ねない）に合わせた設計です。独自に表示物を足すときも、動画の範囲には置かないでください
 
 ## ファイル構成
 
@@ -152,12 +171,19 @@ tani-watch/
 - Twitchの一部コンテンツは地域制限がある場合があります
 - Twitchのクリップは、埋め込みの仕様上、音量の操作ができません
 - 画面共有は `Config.NearbyDistance` 以内のプレイヤーにのみ可能です
-- 動画は画面中央にオーバーレイ表示されます
+- 動画は画面の中央より少し下にオーバーレイ表示されます（上と左右に通知用の余白を残します）
+- YouTube プレイヤー自身のボタン（一時停止・シークなど）は、ゲーム内では操作できません（マウス操作を DUI に渡していないため）。音量とミュートは、画面下のスライダーとボタンで操作します
+- 再生位置は同期しません。ライブ配信なら同じ場面を観られますが、通常の動画は、各自が再生を始めた位置から流れます
 - リソースのフォルダ名を変えても動作します（リソース名は実行時に取得します）
 - 視聴中（`Config.AllowGameInputWhileWatching = true`）は、マウスのクリックが射撃・殴打として、マウスの移動がカメラの回転としてゲームに届かないよう、視点・攻撃・照準のコントロールを無効にしています。歩く・運転するキーボード操作はそのまま使えます
 - YouTube と Twitch の埋め込みプレイヤーは、再生中に広告が表示されることがあります。Cfx.re の Creator Platform License Agreement（3.1 項 (7) が、ゲーム内への第三者の広告の組み込みを禁じています）との関係は、サーバー運営者が確認してください
 
 ## 更新履歴
+
+### 2.2.2
+- 【YouTube の埋め込み要件への適合】通知（トースト）と共有の確認が、動画の上に重ならないようにした。動画を画面の幅の約62%・中央より少し下に描き、共有の確認は上の余白、トーストは右の余白に出す。位置と大きさは `Config.VideoWidth` / `Config.VideoMaxHeight` / `Config.VideoCenterY` で変えられる
+- 【ドキュメント】YouTube 利用規約・Google プライバシーポリシー・Twitch の規約へのリンクと、サーバー運営者向けの注意（視聴の有料化の禁止、コンテンツの権利の確認）を追記。YouTube プレイヤーのボタンがゲーム内で操作できないこと、再生位置が同期しないことも明記
+- 【クレジットの表記】ptelevision は「着想の参考」と明記し、コードは流用していないことを書いた
 
 ### 2.2.1
 - 【不具合修正】視聴中にカーソルを出したままゲームへ入力を渡している間、視点（カメラ）と攻撃・照準のコントロールを無効にした（ボタンのクリックが射撃になったり、カメラが動いたりするのを防ぐ）
@@ -175,7 +201,7 @@ tani-watch/
 
 ## クレジット
 
-- DUI技術の参考: [ptelevision](https://github.com/PickleModifications/ptelevision)
+- 着想の参考: [ptelevision](https://github.com/PickleModifications/ptelevision)（DUI で動画を画面に描く手法を参考にしました。コードは流用していません）
 - フォント: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）
 
 ## ライセンス

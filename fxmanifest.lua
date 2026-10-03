@@ -4,7 +4,7 @@ game 'gta5'
 name 'tani-watch'
 description 'YouTube/Twitch Video Player with DUI and screen sharing'
 author 'Tani'
-version '2.2.1'
+version '2.2.2'
 
 shared_scripts {
     'config.lua',

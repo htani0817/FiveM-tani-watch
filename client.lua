@@ -515,17 +515,18 @@ CreateThread(function()
         if isPlaying and duiObject then
             Wait(0)
 
-            -- 16:9 の動画を、画面の縦横比に合わせて歪まないように描く
+            -- 16:9 の動画を、画面の縦横比に合わせて歪まないように描く。
+            -- 上と左右に余白を残し、通知や共有の確認はその余白に出す（動画の上には重ねない）
             local aspect = GetAspectRatio(false)
-            local width = 0.7
+            local width = Config.VideoWidth
             local height = width * aspect * 9 / 16
-            if height > 0.8 then
-                height = 0.8
+            if height > Config.VideoMaxHeight then
+                height = Config.VideoMaxHeight
                 width = height * 16 / (9 * aspect)
             end
 
             SetScriptGfxDrawBehindPausemenu(true)
-            DrawSprite(TXD_NAME, TEXTURE_NAME, 0.5, 0.45, width, height, 0.0, 255, 255, 255, 255)
+            DrawSprite(TXD_NAME, TEXTURE_NAME, 0.5, Config.VideoCenterY, width, height, 0.0, 255, 255, 255, 255)
             SetScriptGfxDrawBehindPausemenu(false)
         else
             Wait(100)
